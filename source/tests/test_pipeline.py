@@ -70,41 +70,39 @@ assert job.problems() == []
 
 s = core.RunSettings(dw_dir=dw_dir, iterations=10, threads=4)
 prog = []
-out = core.process_job(
+out_dir = core.process_job(
     job,
     s,
     log=lambda m: print("LOG", m),
     progress=lambda f, t: prog.append((f, t)),
     cancel=threading.Event(),
 )
-print("output:", out)
+print("output folder:", out_dir, sorted(p.name for p in out_dir.iterdir()))
 
-with tifffile.TiffFile(out) as tf:
-    assert tf.is_ome
-    arr = tf.asarray()
-    ome = tf.ome_metadata
-print("shape", arr.shape, arr.dtype)
-assert arr.shape == (C, Z, Y, X) and arr.dtype == np.uint16
-for s_ in [
-    'Name="CY5"',
-    'Name="TRITC"',
-    'Name="GFP"',
-    'PhysicalSizeX="0.065"',
-    'PhysicalSizeZ="0.2"',
-    'EmissionWavelength="680.0"',
-    'Color="-16711681"',
-]:
-    assert s_ in ome, s_
-# Dots should be sharper after deconvolution
-for c in range(C):
+# one TIFF and one dw log per channel
+stem = fake_nd2.stem
+expected = [
+    f"dw_{stem}_C1_CY5.tif",
+    f"dw_{stem}_C2_TRITC.tif",
+    f"dw_{stem}_C3_GFP.tif",
+]
+for c, name in enumerate(expected):
+    f = out_dir / name
+    assert f.exists(), name
+    assert (out_dir / (name + ".log.txt")).exists(), name + ".log.txt"
+    arr = tifffile.imread(f)
+    assert arr.shape == (Z, Y, X) and arr.dtype == np.uint16, arr.shape
+    # Dots should be sharper after deconvolution
     before = data[c].max() / data[c].mean()
-    after = arr[c].max() / arr[c].mean()
-    print(f"channel {c}: peak/mean before {before:.1f} after {after:.1f}")
+    after = arr.max() / arr.mean()
+    print(f"{name}: peak/mean before {before:.1f} after {after:.1f}")
     assert after > before
+params = (out_dir / f"dw_{stem}_params.txt").read_text()
+assert "lambda=680" in params and "Commands:" in params
 assert prog[-1][0] == 1.0
 assert any("iteration 10/10" in t for _, t in prog), [t for _, t in prog]
 assert not any(
-    p.name.startswith(".") for p in out.parent.iterdir()
+    p.name.startswith(".") for p in out_dir.iterdir()
 ), "work folder not cleaned up"
 
 # Running again should refuse to overwrite the output

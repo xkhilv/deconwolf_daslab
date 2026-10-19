@@ -415,7 +415,7 @@ class App(tk.Tk):
         tags = ()
         if job.status == "Done":
             tags = ("done",)
-            text = job.output or text
+            text = f"Saved in {job.output}" if job.output else text
         elif probs or job.status in ("Error", "Failed"):
             tags = ("bad",)
         elif notes or any(c.warning for c in job.channels):
@@ -733,7 +733,7 @@ class App(tk.Tk):
         if not p:
             done = [j for j in self.jobs.values() if j.output]
             src = (
-                Path(done[-1].output).parent
+                Path(done[-1].output)
                 if done
                 else (
                     Path(next(iter(self.jobs.values())).path).parent

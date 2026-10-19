@@ -6,7 +6,7 @@ steps for each ND2 file:
 2. save each channel as its own TIFF
 3. make a PSF for each channel with dw_bw
 4. deconvolve each channel with dw
-5. combine the channels into one OME-TIFF with the original names, colors and pixel size
+5. save deconwolf's output for each channel as its own TIFF
 """
 
 from __future__ import annotations
@@ -509,10 +509,20 @@ def _run(
         time.sleep(0.05)
 
 
-def output_path_for(job: FileJob, s: RunSettings) -> Path:
+def output_dir_for(job: FileJob, s: RunSettings) -> Path:
     src = Path(job.path)
-    out_dir = Path(s.out_dir) if s.out_dir else src.parent / "deconvolved"
-    return out_dir / f"{src.stem}_dw.ome.tif"
+    return Path(s.out_dir) if s.out_dir else src.parent / "deconvolved"
+
+
+def channel_output_path(job: FileJob, c: ChannelInfo, s: RunSettings) -> Path:
+    """output name for one channel, like dw_image1_C1_CY5.tif"""
+    safe = re.sub(r"[^A-Za-z0-9_-]+", "_", c.name).strip("_") or "ch"
+    stem = Path(job.path).stem
+    return output_dir_for(job, s) / f"dw_{stem}_C{c.index + 1}_{safe}.tif"
+
+
+def params_path_for(job: FileJob, s: RunSettings) -> Path:
+    return output_dir_for(job, s) / f"dw_{Path(job.path).stem}_params.txt"
 
 
 def psf_path_for(job: FileJob, lam: float) -> Path:
@@ -590,44 +600,6 @@ def read_stack(path: str) -> tuple[np.ndarray, list[str]]:
     return np.ascontiguousarray(np.transpose(arr, order)), dims
 
 
-def _ome_color(rgb: tuple[int, int, int]) -> int:
-    """convert RGB to the signed 32-bit number OME uses for colors"""
-    r, g, b = (int(v) & 0xFF for v in rgb)
-    v = (r << 24) | (g << 16) | (b << 8) | 0xFF
-    return v - (1 << 32) if v >= (1 << 31) else v
-
-
-def write_ome_tiff(
-    path: Path, data_czyx: np.ndarray, job: FileJob, description: str
-) -> None:
-    md = {
-        "axes": "CZYX",
-        "PhysicalSizeX": job.dxy_nm / 1000.0,
-        "PhysicalSizeXUnit": "µm",
-        "PhysicalSizeY": job.dxy_nm / 1000.0,
-        "PhysicalSizeYUnit": "µm",
-        "PhysicalSizeZ": job.dz_nm / 1000.0,
-        "PhysicalSizeZUnit": "µm",
-        "Channel": {
-            "Name": [c.name for c in job.channels],
-            "Color": [_ome_color(c.color_rgb) for c in job.channels],
-            "EmissionWavelength": [float(c.emission_nm) for c in job.channels],
-            "EmissionWavelengthUnit": ["nm"] * len(job.channels),
-        },
-        "Description": description,
-    }
-    tmp = path.with_name(path.name + ".partial")
-    tifffile.imwrite(
-        tmp,
-        data_czyx,
-        ome=True,
-        photometric="minisblack",
-        metadata=md,
-        bigtiff=data_czyx.nbytes > 3_500_000_000,
-    )
-    tmp.replace(path)
-
-
 def _scaling_from_log(p: Path) -> Optional[float]:
     """read the output scaling factor from dw's log file"""
     try:
@@ -646,24 +618,22 @@ def process_job(
     progress: ProgressFn,
     cancel: threading.Event,
 ) -> Path:
-    """run the full pipeline on one ND2 file; returns the output path"""
+    """run the full pipeline on one ND2 file; returns the output folder"""
     probs = job.problems()
     if probs:
         raise RuntimeError("; ".join(probs))
-    out = output_path_for(job, s)
-    if out.exists() and not s.overwrite:
-        raise FileExistsError(str(out))
-    out.parent.mkdir(parents=True, exist_ok=True)
+    out_dir = output_dir_for(job, s)
+    outs = [channel_output_path(job, c, s) for c in job.channels]
+    existing = [o for o in outs if o.exists()]
+    if existing and not s.overwrite:
+        raise FileExistsError(str(existing[0]))
+    out_dir.mkdir(parents=True, exist_ok=True)
     work = Path(
-        tempfile.mkdtemp(
-            prefix=f".{Path(job.path).stem[:40]}_work_", dir=out.parent
-        )
+        tempfile.mkdtemp(prefix=f".{Path(job.path).stem[:40]}_work_", dir=out_dir)
     )
     dw = _exe(Path(s.dw_dir), "dw")
     n_c = len(job.channels)
-    steps = (
-        1 + 2 * n_c + 1
-    )  # read, then PSF and deconvolve per channel, then write
+    steps = 1 + 2 * n_c  # read, then PSF and deconvolve per channel
     done = 0
 
     def step(text: str, sub: float = 0.0):
@@ -686,20 +656,18 @@ def process_job(
             p = work / f"c{c.index + 1}.tif"
             tifffile.imwrite(p, data[c.index], photometric="minisblack")
             ch_files.append(p)
-        shape = data.shape
         del data
         done += 1
 
         # PSF and deconvolution for each channel
-        results, scalings, commands = [], [], []
-        for c, inp in zip(job.channels, ch_files):
+        # dw writes straight to the output folder
+        scalings, commands = [], []
+        for c, inp, outc in zip(job.channels, ch_files, outs):
             if cancel.is_set():
                 raise Cancelled()
             step(f"PSF for {c.name} ({c.emission_nm:g} nm)")
             psf = make_psf(job, c.emission_nm, s, log, cancel)
             done += 1
-
-            outc = work / f"dw_c{c.index + 1}.tif"
 
             def dw_cmd(tilesize: int) -> list[str]:
                 cmd = [
@@ -729,7 +697,7 @@ def process_job(
 
             step(f"Deconvolving {c.name}")
             cmd = dw_cmd(s.tilesize)
-            dwlog = Path(str(outc) + ".log.txt")
+            dwlog = Path(str(outc) + ".log.txt")  # dw names its log after the output
             dwlog.unlink(missing_ok=True)
             rc = _run(cmd, log, cancel, on_line, watch=dwlog)
             # a failure here is usually running out of memory, so try once more with tiles
@@ -747,20 +715,10 @@ def process_job(
                 )
             commands.append(" ".join(cmd))
             scalings.append(_scaling_from_log(dwlog))
-            results.append(outc)
+            log(f"Saved {outc}")
             done += 1
 
-        # combine channels into one OME-TIFF
-        step("Writing OME-TIFF")
-        stack = np.empty(shape, dtype=np.uint16)
-        for c, r in zip(job.channels, results):
-            img = tifffile.imread(r)
-            if img.shape != shape[1:]:
-                raise RuntimeError(
-                    f"output for {c.name} has shape {img.shape}, expected {shape[1:]}"
-                )
-            stack[c.index] = img
-
+        # settings file for this ND2
         lines = [
             f"Deconvolved with deconwolf using {APP_NAME} {APP_VERSION}",
             f"Source: {Path(job.path).name}",
@@ -768,23 +726,20 @@ def process_job(
             f"Pixel size: {job.dxy_nm:g} nm  Z step: {job.dz_nm:g} nm ({job.dz_source or 'user'})",
             f"Iterations: {s.iterations}  GPU: {s.gpu}  Tilesize: {s.tilesize or 'off'}",
         ]
-        for c, sc in zip(job.channels, scalings):
+        for c, sc, o in zip(job.channels, scalings, outs):
             lines.append(
                 f"Channel {c.index + 1} {c.name}: lambda={c.emission_nm:g} nm ({c.source}), "
-                f"output scaling={sc if sc is not None else '?'}"
+                f"output scaling={sc if sc is not None else '?'}, file={o.name}"
             )
         if in_dtype != np.uint16:
-            lines.append(f"Input pixel type was {in_dtype}; output is uint16")
+            lines.append(f"Input pixel type was {in_dtype}")
         desc = "\n".join(lines)
-        write_ome_tiff(out, stack, job, desc)
-        Path(str(out) + ".params.txt").write_text(
+        params_path_for(job, s).write_text(
             desc + "\n\nCommands:\n" + "\n".join(commands) + "\n",
             encoding="utf-8",
         )
-        done += 1
         step("Done")
-        log(f"Saved {out}")
-        return out
+        return out_dir
     finally:
         if s.keep_intermediate:
             log(f"Intermediate files kept in {work}")
